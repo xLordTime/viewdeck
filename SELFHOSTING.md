@@ -5,14 +5,15 @@ Die Docker-Version nutzt SQLite auf deinem Server. Dateien, Sammlungen, View-Cod
 Du brauchst Git, Bash, flock (util-linux), Docker Engine und Docker Compose mit Unterstützung für `up --wait`. Führe die Befehle auf deinem Server mit einem Benutzer aus, der Docker verwenden darf.
 
 ```bash
-sudo install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" /srv/Viewdeck
-git clone https://github.com/xLordTime/viewdeck.git /srv/Viewdeck
-cd /srv/Viewdeck
+sudo mkdir -p /srv/web-hosting
+sudo install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" /srv/web-hosting/Viewdeck
+git clone https://github.com/xLordTime/viewdeck.git /srv/web-hosting/Viewdeck
+cd /srv/web-hosting/Viewdeck
 (umask 077; cp .env.example .env)
 nano .env
 ```
 
-Die Befehle oben gelten für die Erstinstallation in einem leeren Zielordner. Liegt das Repository bereits unter `/srv/Viewdeck/`, gehe direkt zu Abschnitt 4. Eine vorhandene `.env` kannst du mit `nano /srv/Viewdeck/.env` bearbeiten.
+Die Befehle oben gelten für die Erstinstallation in einem leeren Zielordner. Liegt das Repository bereits unter `/srv/web-hosting/Viewdeck/`, gehe direkt zu Abschnitt 4. Eine vorhandene `.env` kannst du mit `nano /srv/web-hosting/Viewdeck/.env` bearbeiten.
 
 ## 2. Adresse und Anmeldung eintragen
 Setze `PUBLIC_ORIGIN` auf deine tatsächliche öffentliche HTTPS-Adresse, beispielsweise `https://viewdeck.edle-entdecker.pro`. Wähle bei einem Portkonflikt in `VIEWDECK_PORT` einen freien lokalen Port. Trage für mindestens einen Anbieter beide Werte ein. Die Zugangsdaten bleiben in der lokalen Datei `.env`.
@@ -44,7 +45,7 @@ Läuft der Proxy selbst in Docker, verbinde seinen Container und den Viewdeck-Di
 
 ## 4. Spätere Updates
 ```bash
-cd /srv/Viewdeck
+cd /srv/web-hosting/Viewdeck
 bash update.sh
 ```
 Das Skript holt main per Fast-forward, baut zuerst das neue Image und wartet nach dem Containerwechsel auf den Healthcheck. Beim Wechsel kann die Website kurz unterbrochen sein. .env und das benannte Volume bleiben erhalten. Bei Fehlern helfen `docker compose ps -a` und `docker compose logs --tail=80 web`. Nach Änderungen an .env übernimmt ein weiterer Skriptlauf die Konfiguration.
