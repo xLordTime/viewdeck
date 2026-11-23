@@ -1,0 +1,11 @@
+import fs from 'node:fs';
+import {execFileSync} from 'node:child_process';
+import page from './page.mjs';
+const source=['worker.mjs','page.mjs','build.mjs','README.md','LICENSE'];
+fs.mkdirSync('dist/server',{recursive:true});fs.mkdirSync('dist/.openai',{recursive:true});
+fs.copyFileSync('.openai/hosting.json','dist/.openai/hosting.json');
+if(process.platform==='win32')execFileSync('pwsh',['-NoProfile','-Command',"Compress-Archive -Force -Path "+source.join(',')+" -DestinationPath dist/source.zip"]);
+else execFileSync('zip',['-j','dist/source.zip',...source]);
+let code=fs.readFileSync('worker.mjs','utf8').replace("import page from './page.mjs';",()=> 'const page='+JSON.stringify(page)+';');
+code=code.replace("const bucket=env.BUCKET;",()=> "if(p==='/source.zip')return new Response(Uint8Array.from(atob('"+fs.readFileSync('dist/source.zip').toString('base64')+"'),c=>c.charCodeAt(0)),{headers:{'Content-Type':'application/zip'}});const bucket=env.BUCKET;");
+fs.writeFileSync('dist/server/index.js',code);
