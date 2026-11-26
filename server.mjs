@@ -37,7 +37,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS accounts (
   sorting TEXT NOT NULL DEFAULT 'newest', filter TEXT NOT NULL DEFAULT 'all'
 );
 CREATE INDEX IF NOT EXISTS objects_owner ON objects(json_extract(metadata,'$.owner'));`);
-const limits = {standard:25, plus:50, pro:100};
+const limits = {standard:25, plus:50, pro:100, admin:null};
 const accounts = {
   profile(owner) {
     db.prepare('INSERT OR IGNORE INTO accounts(owner) VALUES (?)').run(owner);
@@ -66,7 +66,7 @@ if (process.argv[2] === 'roles') {
     if (!result.changes) { console.error('Unbekannte Konto-ID. Einmal in Viewdeck anmelden.'); process.exit(1); }
     console.log(owner,role);
   } else {
-    console.error('roles list | roles set KONTO-ID standard|plus|pro'); process.exit(1);
+    console.error('roles list | roles set KONTO-ID standard|plus|pro|admin'); process.exit(1);
   }
   db.close(); process.exit(0);
 }
@@ -87,7 +87,7 @@ http.createServer(async (incoming, outgoing) => {
     if (incoming.method === 'POST' && url.pathname === '/api/upload') {
       const owner = await identity(new Request(url,{headers}), env);
       if (!owner) { outgoing.writeHead(401,{'Content-Type':'application/json'}).end(JSON.stringify('Anmeldung erforderlich')); return; }
-      limit = accounts.profile(owner).maxMiB * 1024 * 1024;
+      limit = (accounts.profile(owner).maxMiB ?? Infinity) * 1024 * 1024;
       if (Number(headers.get('content-length')) > limit) {
         outgoing.writeHead(413,{'Content-Type':'application/json'}).end(JSON.stringify('Datei überschreitet dein Uploadlimit.')); return;
       }
