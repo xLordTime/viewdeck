@@ -63,11 +63,11 @@ Sichere auch .env vertraulich und kopiere beides auf einen zweiten Datenträger.
 ## Persönliche Codes und Rollen
 Nach der Anmeldung zeigt „Meine Codes“ deine Dateien und Sammlungen einschließlich früherer Uploads desselben Kontos. Unter Einstellungen kannst du Sortierung und Standardfilter pro Konto speichern. Google und Discord führen getrennte Konten.
 
-Die Rolle gilt pro Datei: standard 25 MiB, plus 50 MiB, pro 100 MiB. Passe das Uploadlimit deines Reverse-Proxys an die größte genutzte Rolle an. Die Konto-ID steht unter „Meine Codes“. Rollen vergibst du ausschließlich in der Serverkonsole:
+Die Rolle gilt pro Datei: standard 25 MiB, plus 50 MiB, pro 100 MiB, admin ohne anwendungsseitiges Dateigrößenlimit. Passe das Uploadlimit deines Reverse-Proxys an die größte genutzte Rolle an. Die Konto-ID steht unter „Meine Codes“. Rollen vergibst du ausschließlich in der Serverkonsole:
 
 ```bash
 cd /srv/web-hosting/Viewdeck
 docker compose exec web node server.mjs roles list
-docker compose exec web node server.mjs roles set 'discord:DEINE_USER_ID' plus
+docker compose exec web node server.mjs roles set 'discord:DEINE_USER_ID' admin
 ```
 Mit `standard` setzt du das Limit zurück. Bestehende Dateien behalten ihren Code. Lade die Seite nach einer Rollenänderung neu.
