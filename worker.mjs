@@ -15,7 +15,21 @@ export async function identity(req,env){
  const s=await entry.json();if(s.until>Date.now())return s.owner;
  await env.BUCKET.delete('session/'+id);return null;
 }
+async function session(env,owner){
+ const id=token();
+ await env.BUCKET.put('session/'+id,JSON.stringify({owner,until:Date.now()+86400000}));
+ return setCookie('__Host-vds',id,86400);
+}
 async function oauth(req,env,u){
+ if(u.pathname.startsWith('/auth/local/')){
+  if(!env.ACCOUNTS||req.method!=='POST'||req.headers.get('Origin')!==u.origin)return json('Ungültige Anfrage',403);
+  const action=u.pathname.slice('/auth/local/'.length), owner=await identity(req,env);
+  if(!['register','login','update'].includes(action)||(action==='update'?!owner:!!owner))return json('Aktion nicht verfügbar.',400);
+  try{
+   const canonical=await env.ACCOUNTS.local(action,owner,await req.json());
+   return Response.json(true,{headers:{'Set-Cookie':await session(env,canonical),'Cache-Control':'no-store'}});
+  }catch(e){return json(e.status?e.message:'Anfrage fehlgeschlagen.',e.status||400)}
+ }
  if (u.pathname === '/auth/logout' && req.method === 'GET') {
   const html = '<!doctype html><html lang="de"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Viewdeck · Abmelden</title><main><h1>Von Viewdeck abmelden?</h1><form method="post" action="/auth/logout"><button>Abmelden</button></form><p><a href="/">Zurück zu Viewdeck</a></p></main></html>';
   return new Response(html,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','Referrer-Policy':'same-origin','Content-Security-Policy':"frame-ancestors 'none'; form-action 'self'"}});
@@ -23,13 +37,23 @@ async function oauth(req,env,u){
  if(u.pathname==='/auth/logout'){if(req.method!=='POST'||req.headers.get('Origin')!==u.origin)return new Response(null,{status:403});const id=cookie(req,'__Host-vds');if(id&&/^[a-f0-9-]{72}$/.test(id))await env.BUCKET.delete('session/'+id);return jump('/signout-with-chatgpt?return_to=/',setCookie('__Host-vds','',0))}
  const [,a,p,step]=u.pathname.split('/'),provider=Object.hasOwn(providers,p)&&providers[p];if(!provider||!enabled(env,p))return new Response('Anbieter ist noch nicht eingerichtet.',{status:503});
  const redirect=u.origin+'/auth/'+p+'/callback',client_id=env[p.toUpperCase()+'_CLIENT_ID'];
- if(!step){const state=token(),next=new URL(provider.authorize);next.search=new URLSearchParams({client_id,redirect_uri:redirect,state,response_type:'code',scope:provider.scope});return jump(next.href,setCookie('__Host-vdo',p+'.'+state,600))}
- const state=u.searchParams.get('state'),code=u.searchParams.get('code');if(step!=='callback'||!code||!state||cookie(req,'__Host-vdo')!==p+'.'+state)return new Response('Anmeldung abgelaufen. Bitte erneut anmelden.',{status:400});
+ if(!step||step==='link'){
+ const linking=step==='link';
+ if(linking&&(!env.ACCOUNTS||req.method!=='POST'||req.headers.get('Origin')!==u.origin||!await identity(req,env)||!cookie(req,'__Host-vds')))return json('Anmeldung erforderlich',403);
+ const state=token(),next=new URL(provider.authorize);next.search=new URLSearchParams({client_id,redirect_uri:redirect,state,response_type:'code',scope:provider.scope});return jump(next.href,setCookie('__Host-vdo',p+'.'+state+(linking?'.'+cookie(req,'__Host-vds'):''),600))}
+ const state=u.searchParams.get('state'),code=u.searchParams.get('code');const expected=p+'.'+state, saved=cookie(req,'__Host-vdo'), linking=saved?.startsWith(expected+'.');
+ if(step!=='callback'||!code||!state||(saved!==expected&&!(linking&&saved===expected+'.'+cookie(req,'__Host-vds'))))return new Response('Anmeldung abgelaufen. Bitte erneut anmelden.',{status:400});
  const response=await fetch(provider.token,{method:'POST',body:new URLSearchParams({grant_type:'authorization_code',code,client_id,client_secret:env[p.toUpperCase()+'_CLIENT_SECRET'],redirect_uri:redirect})});if(!response.ok)return new Response('Anmeldung fehlgeschlagen.',{status:401});
  const {access_token}=await response.json(),profile=await fetch(provider.profile,{headers:{Authorization:'Bearer '+access_token}});if(!profile.ok)return new Response('Profil nicht verfügbar.',{status:401});
- const sub=(await profile.json())[provider.key];if(typeof sub!=='string'||!sub)return new Response(null,{status:401});
- const id=token();await env.BUCKET.put('session/'+id,JSON.stringify({owner:p+':'+sub,until:Date.now()+86400000}));
- const done=jump('/',setCookie('__Host-vds',id,86400));done.headers.append('Set-Cookie',setCookie('__Host-vdo','',0));return done;
+ const data=await profile.json(), sub=data[provider.key];if(typeof sub!=='string'||!sub)return new Response(null,{status:401});
+ const target=linking?await identity(req,env):null;
+ if(linking&&!target)return json('Verknüpfung abgelaufen',403);
+ const subject=p+':'+sub;
+ const name=String(data.global_name||data.name||data.username||subject).slice(0,80);
+ const avatar=p==='discord'&&data.avatar?'https://cdn.discordapp.com/avatars/'+encodeURIComponent(sub)+'/'+encodeURIComponent(data.avatar)+'.png':p==='google'&&/^https:\/\//.test(data.picture||'')?data.picture:'';
+ let owner;
+ try{owner=env.ACCOUNTS?env.ACCOUNTS.oauth(subject,target,name,avatar):subject}catch(e){return json(e.status?e.message:'Anmeldung fehlgeschlagen',e.status||500)}
+ const done=jump('/',await session(env,owner));done.headers.append('Set-Cookie',setCookie('__Host-vdo','',0));return done;
 }
 
 const json=(v,status=200)=>Response.json(v,{status,headers:{'Cache-Control':'no-store'}});
@@ -38,11 +62,14 @@ const valid=c=>/^[A-Z2-9]{8}$/.test(c);
 export default {async fetch(req,env){
  const u=new URL(req.url), p=u.pathname; if(p.startsWith('/auth/'))return oauth(req,env,u); const owner=(p==='/api/me'||p==='/api/library'||req.method==='POST')?await identity(req,env):null;
  const bucket=env.BUCKET;
- if(p==='/api/me')return json({signed:!!owner,profile:owner&&env.ACCOUNTS?env.ACCOUNTS.profile(owner):null,providers:Object.keys(providers).filter(p=>enabled(env,p))});
+ if(p==='/api/me')return json({local:!!env.ACCOUNTS,signed:!!owner,profile:owner&&env.ACCOUNTS?env.ACCOUNTS.profile(owner):null,providers:Object.keys(providers).filter(p=>enabled(env,p))});
  if(p==='/api/library' && env.ACCOUNTS) return owner?json(env.ACCOUNTS.list(owner)):json('Anmeldung erforderlich',401);
  if(req.method==='POST'){
   if(!owner)return json('Anmeldung erforderlich',401);
   if(req.headers.get('Origin')!==u.origin)return json('Ungültiger Ursprung',403);
+  if(p==='/api/profile'&&env.ACCOUNTS){
+   try{env.ACCOUNTS.edit(owner,await req.json());return json(true)}catch(e){return json(e.status?e.message:'Ungültige Profildaten',e.status||400)}
+  }
   if(p==='/api/settings' && env.ACCOUNTS){
    const settings=await req.json().catch(()=>null);
    if(!settings || !['newest','name'].includes(settings.sorting) || !['all','file','group'].includes(settings.filter))return json('Ungültige Einstellung',400);
