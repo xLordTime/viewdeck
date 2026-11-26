@@ -278,6 +278,13 @@ http.createServer(async (incoming, outgoing) => {
     if (!path.startsWith('/') || path.startsWith('//')) { outgoing.writeHead(400).end(); return; }
     const url = new URL(origin.origin + path);
     if (url.origin !== origin.origin) { outgoing.writeHead(400).end(); return; }
+    if(url.pathname==='/assets/pptxjs.umd.js' && incoming.method==='GET'){
+      const asset=new URL('./pptxjs.umd.js',import.meta.url);
+      const stream=createReadStream(asset);
+      stream.once('open',()=>{outgoing.writeHead(200,{'Content-Type':'application/javascript','X-Content-Type-Options':'nosniff'});stream.pipe(outgoing)});
+      stream.on('error',()=>{if(!outgoing.headersSent)outgoing.writeHead(404);outgoing.end()});
+      return;
+    }
     if (url.pathname === '/healthz') { db.prepare('SELECT 1').get(); outgoing.end('ok'); return; }
     if (url.pathname === '/signout-with-chatgpt') { outgoing.writeHead(303,{Location:'/'}).end(); return; }
     const headers = new Headers();
