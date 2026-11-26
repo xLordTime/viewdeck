@@ -1,6 +1,10 @@
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { unlink } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, createReadStream, createWriteStream } from 'node:fs';
 import { join } from 'node:path';
 import worker, {identity} from './worker.mjs';
 
@@ -16,16 +20,36 @@ const metadata = db.prepare('SELECT metadata FROM objects WHERE key=?');
 const read = db.prepare('SELECT metadata, body FROM objects WHERE key=?');
 const insert = db.prepare('INSERT INTO objects VALUES (?,?,?)');
 const remove = db.prepare('DELETE FROM objects WHERE key=?');
+// Keep upload payloads on disk. Immutable random names decouple storage from share codes.
+const filesDir = join(directory,'files');
+mkdirSync(filesDir,{recursive:true});
 const bucket = {
   head(key) {
     const row = metadata.get(key);
     return row && {customMetadata:JSON.parse(row.metadata)};
   },
   get(key) {
+    if(key.startsWith('file/')){
+      const meta=this.head(key)?.customMetadata;
+      if(!meta)return null;
+      if(meta.disk)return {body:Readable.toWeb(createReadStream(join(filesDir,meta.disk)))};
+      const size=db.prepare('SELECT length(body) AS n FROM objects WHERE key=?').get(key).n;
+      const part=db.prepare('SELECT substr(body,?,?) AS bytes FROM objects WHERE key=?');
+      async function* legacy(){for(let offset=0;offset<size;offset+=65536)yield part.get(offset+1,65536,key).bytes}
+      return {body:Readable.toWeb(Readable.from(legacy()))};
+    }
     const row = read.get(key);
     return row && {body:row.body, customMetadata:JSON.parse(row.metadata), json:()=>JSON.parse(Buffer.from(row.body).toString())};
   },
   async put(key, value, options={}) {
+    if(key.startsWith('file/')){
+      const disk=randomUUID(), path=join(filesDir,disk);
+      try{
+        await pipeline(Readable.fromWeb(value),createWriteStream(path,{flags:'wx'}));
+        insert.run(key,JSON.stringify({...options.customMetadata,disk}),Buffer.alloc(0));
+      }catch(error){await unlink(path).catch(()=>{});throw error}
+      return;
+    }
     const body = Buffer.from(await new Response(value).arrayBuffer());
     insert.run(key, JSON.stringify(options.customMetadata || {}), body);
   },
@@ -45,12 +69,35 @@ const accounts = {
     return {...profile, maxMiB:limits[profile.role]};
   },
   list(owner) {
-    return db.prepare(`SELECT substr(key,instr(key,'/')+1) AS code,
+    return db.prepare(`SELECT substr(key,instr(key,'/')+1) AS code,json_extract(metadata,'$.revoked') AS revoked,
       CASE WHEN key LIKE 'file/%' THEN 'file' ELSE 'group' END AS kind,
       CASE WHEN key LIKE 'file/%' THEN json_extract(metadata,'$.name')
            ELSE json_extract(CAST(body AS TEXT),'$.title') END AS name
       FROM objects WHERE json_extract(metadata,'$.owner')=? AND
       (key LIKE 'file/%' OR key LIKE 'group/%') ORDER BY rowid DESC`).all(owner);
+  },
+  share(owner,id,action,newId){
+    db.exec('BEGIN IMMEDIATE');
+    try{
+      let key='file/'+id;
+      if(!metadata.get(key))key='group/'+id;
+      const meta=bucket.head(key)?.customMetadata;
+      if(meta?.owner!==owner){db.exec('ROLLBACK');return false}
+      const group=key.startsWith('group/');
+      if(action==='rotate'&&(metadata.get('file/'+newId)||metadata.get('group/'+newId)))throw Error('Code collision');
+      meta.revoked=action==='revoke';
+      db.prepare('UPDATE objects SET key=?,metadata=? WHERE key=?').run(action==='rotate'?key.split('/')[0]+'/'+newId:key,JSON.stringify(meta),key);
+      if(!group && action==='rotate'){
+        const groups=db.prepare("SELECT key,body FROM objects WHERE key LIKE 'group/%' AND json_extract(metadata,'$.owner')=?").all(owner);
+        for(const row of groups){
+          const data=JSON.parse(Buffer.from(row.body));
+          if(!data.ids.includes(id))continue;
+          data.ids=data.ids.map(code=>code===id?newId:code);
+          db.prepare('UPDATE objects SET body=? WHERE key=?').run(Buffer.from(JSON.stringify(data)),row.key);
+        }
+      }
+      db.exec('COMMIT');return true;
+    }catch(error){db.exec('ROLLBACK');throw error}
   },
   save(owner, sorting, filter) {
     this.profile(owner);
@@ -84,6 +131,7 @@ http.createServer(async (incoming, outgoing) => {
       if (incoming.headers[name]) headers.set(name,incoming.headers[name]);
     }
     let limit = 32*1024;
+    let body;
     if (incoming.method === 'POST' && url.pathname === '/api/upload') {
       const owner = await identity(new Request(url,{headers}), env);
       if (!owner) { outgoing.writeHead(401,{'Content-Type':'application/json'}).end(JSON.stringify('Anmeldung erforderlich')); return; }
@@ -91,9 +139,15 @@ http.createServer(async (incoming, outgoing) => {
       if (Number(headers.get('content-length')) > limit) {
         outgoing.writeHead(413,{'Content-Type':'application/json'}).end(JSON.stringify('Datei überschreitet dein Uploadlimit.')); return;
       }
-    }
-    let body;
-    if (incoming.method === 'POST') {
+      let received=0;
+      const counter=new Transform({transform(chunk,encoding,done){
+        received+=chunk.length;
+        if(received>limit)return done(Object.assign(Error('Uploadlimit überschritten'),{status:413}));
+        done(null,chunk);
+      }});
+      incoming.on('error',error=>counter.destroy(error));
+      body=Readable.toWeb(incoming.pipe(counter));
+    } else if (incoming.method === 'POST') {
       const parts = [];
       let size = 0;
       for await (const chunk of incoming) {
@@ -104,7 +158,7 @@ http.createServer(async (incoming, outgoing) => {
       body = Buffer.concat(parts);
       headers.set('content-length',String(size));
     } else if (!['HEAD','GET'].includes(incoming.method)) { outgoing.writeHead(405).end(); return; }
-    const response = await worker.fetch(new Request(url,{method:incoming.method,headers,body}),env);
+    const response = await worker.fetch(new Request(url,{method:incoming.method,headers,body,duplex:'half'}),env);
     for (const [name,value] of response.headers) if (name !== 'set-cookie') outgoing.setHeader(name,value);
     const cookies = response.headers.getSetCookie();
     if (cookies.length) outgoing.setHeader('Set-Cookie',cookies);
@@ -114,10 +168,11 @@ http.createServer(async (incoming, outgoing) => {
       const html = (await response.text()).replace('href="/signin-with-chatgpt?return_to=/"','href="#guest"')
         .replace('<a class="button" target="_top" href="/signin-with-chatgpt?return_to=/">Mit ChatGPT anmelden</a>','');
       outgoing.end(html);
-    } else outgoing.end(Buffer.from(await response.arrayBuffer()));
+    } else if(response.body)await pipeline(Readable.fromWeb(response.body),outgoing);
+    else outgoing.end();
   } catch (error) {
     console.error('Viewdeck request failed:',error.name);
-    if (!outgoing.headersSent) outgoing.writeHead(500);
+    if (!outgoing.headersSent) outgoing.writeHead(error.status||500);
     outgoing.end();
   }
 }).listen(Number(process.env.PORT || 8080),'0.0.0.0');
