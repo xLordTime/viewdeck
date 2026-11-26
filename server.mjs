@@ -27,7 +27,10 @@ mkdirSync(filesDir,{recursive:true});
 const bucket = {
   head(key) {
     const row = metadata.get(key);
-    return row && {customMetadata:JSON.parse(row.metadata)};
+    if(!row)return null;
+    const meta=JSON.parse(row.metadata);
+    if(key.startsWith('file/')&&expiry(meta)<=Date.now()){erase(key,meta);return null}
+    return {customMetadata:meta};
   },
   get(key) {
     if(key.startsWith('file/')){
@@ -47,7 +50,15 @@ const bucket = {
       const disk=randomUUID(), path=join(filesDir,disk);
       try{
         await pipeline(Readable.fromWeb(value),createWriteStream(path,{flags:'wx'}));
-        insert.run(key,JSON.stringify({...options.customMetadata,disk}),Buffer.alloc(0));
+        const meta={...options.customMetadata,created:Date.now(),disk};
+        if(options.replace){
+          const old=this.head(key)?.customMetadata;
+          if(!old||old.owner!==meta.owner)throw invalid('Datei nicht gefunden',404);
+          transaction(()=>{
+            db.prepare('UPDATE objects SET metadata=?,body=? WHERE key=?').run(JSON.stringify({...old,...meta}),Buffer.alloc(0),key);
+            if(old.disk)db.prepare('INSERT INTO garbage VALUES (?)').run(old.disk);
+          });
+        }else insert.run(key,JSON.stringify(meta),Buffer.alloc(0));
       }catch(error){await unlink(path).catch(()=>{});throw error}
       return;
     }
@@ -83,12 +94,96 @@ function details(owner){
  const avatar=prefs.picture==='gravatar'&&prefs.email?'https://www.gravatar.com/avatar/'+createHash('sha256').update(prefs.email.trim().toLowerCase()).digest('hex')+'?s=96&d=identicon':providers.find(p=>p.avatar)?.avatar||'';
  return {...prefs,nickname,avatar,username,methods:providers.map(p=>p.subject.split(':')[0])};
 }
+db.exec(`CREATE TABLE IF NOT EXISTS retention(owner TEXT PRIMARY KEY, enabled INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS recovery(owner TEXT NOT NULL, digest TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS detached(subject TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS garbage(disk TEXT PRIMARY KEY);`);
+const digest=value=>createHash('sha256').update(value).digest('hex');
+const day=86400000;
+db.prepare("UPDATE objects SET metadata=json_set(metadata,'$.created',?) WHERE key LIKE 'file/%' AND json_extract(metadata,'$.created') IS NULL").run(Date.now());
+function expiry(meta){
+ const role=db.prepare('SELECT role FROM accounts WHERE owner=?').get(meta.owner)?.role||'standard';
+ if(['admin','pro'].includes(role)&&db.prepare('SELECT enabled FROM retention WHERE owner=?').get(meta.owner)?.enabled===0)return Infinity;
+ return meta.created+(role==='standard'?15:30)*day;
+}
+function transaction(fn){db.exec('BEGIN IMMEDIATE');try{const result=fn();db.exec('COMMIT');return result}catch(e){db.exec('ROLLBACK');throw e}}
+function erase(key,meta){
+ transaction(()=>{
+  remove.run(key);
+  if(meta.disk)db.prepare('INSERT OR IGNORE INTO garbage VALUES (?)').run(meta.disk);
+  if(!key.startsWith('file/'))return;
+  const id=key.slice(5);
+  for(const row of db.prepare("SELECT key,body FROM objects WHERE key LIKE 'group/%' AND json_extract(metadata,'$.owner')=?").all(meta.owner)){
+   const group=JSON.parse(Buffer.from(row.body));
+   if(!group.ids.includes(id))continue;
+   group.ids=group.ids.filter(code=>code!==id);
+   if(group.ids.length)db.prepare('UPDATE objects SET body=? WHERE key=?').run(Buffer.from(JSON.stringify(group)),row.key);
+   else remove.run(row.key);
+  }
+ });
+}
+let cleaning=false;
+async function sweep(){
+ if(cleaning)return;cleaning=true;
+ try{
+  for(const row of db.prepare("SELECT key,metadata FROM objects WHERE key LIKE 'file/%'").all()){
+   const meta=JSON.parse(row.metadata);if(expiry(meta)<=Date.now())erase(row.key,meta);
+  }
+  for(const {disk} of db.prepare('SELECT disk FROM garbage').all()){
+   try{await unlink(join(filesDir,disk))}catch(e){if(e.code!=='ENOENT')continue}
+   db.prepare('DELETE FROM garbage WHERE disk=?').run(disk);
+  }
+ }finally{cleaning=false}
+}
 const accounts = {
+ retention(owner,enabled){
+  if(typeof enabled!=='boolean'||!['admin','pro'].includes(this.profile(owner).role))throw invalid('Ab Pro einstellbar',403);
+  db.prepare('INSERT OR REPLACE INTO retention VALUES (?,?)').run(owner,Number(enabled));
+ },
+ erase(owner,id){
+  for(const prefix of ['file/','group/']){
+   const key=prefix+id,meta=bucket.head(key)?.customMetadata;
+   if(meta?.owner===owner){erase(key,meta);return}
+  }
+  throw invalid('Eintrag nicht gefunden',404);
+ },
+ security(owner,current){
+  const sessions=db.prepare("SELECT key,body FROM objects WHERE key LIKE 'session/%' AND json_extract(CAST(body AS TEXT),'$.owner')=?").all(owner).map(row=>{
+   const data=JSON.parse(Buffer.from(row.body));return {id:digest(row.key),current:row.key==='session/'+current,until:data.until,device:data.device||'Browser'};
+  }).filter(s=>s.until>Date.now());
+  return {sessions,methods:db.prepare('SELECT name,subject FROM identities WHERE owner=?').all(owner),local:!!db.prepare('SELECT 1 FROM credentials WHERE owner=?').get(owner)};
+ },
+ endSession(owner,id){
+  for(const row of db.prepare("SELECT key FROM objects WHERE key LIKE 'session/%' AND json_extract(CAST(body AS TEXT),'$.owner')=?").all(owner))if(digest(row.key)===id)remove.run(row.key);
+ },
+ unlink(owner,method){
+  const state=this.security(owner,'');
+  if(state.methods.length+Number(state.local)<=1)throw invalid('Mindestens ein Zugang muss bestehen bleiben.');
+  transaction(()=>{
+   if(method==='local')db.prepare('DELETE FROM credentials WHERE owner=?').run(owner);
+   else if(db.prepare('DELETE FROM identities WHERE owner=? AND subject=?').run(owner,method).changes)db.prepare('INSERT OR IGNORE INTO detached VALUES (?)').run(method);
+  });
+ },
+ codes(owner){
+  const codes=Array.from({length:5},()=>randomBytes(16).toString('hex'));
+  transaction(()=>{db.prepare('DELETE FROM recovery WHERE owner=?').run(owner);for(const code of codes)db.prepare('INSERT INTO recovery VALUES (?,?)').run(owner,digest(code))});return codes;
+ },
+ async recover({username,password,code}){
+  if(typeof code!=='string'||typeof username!=='string'||!/^[a-zA-Z0-9_.-]{3,40}$/.test(username)||typeof password!=='string'||password.length<12||password.length>256)throw invalid('Zugangsdaten prüfen.');
+  const hash=digest(code.trim()),owner=db.prepare('SELECT owner FROM recovery WHERE digest=?').get(hash)?.owner;
+  if(!owner)throw invalid('Ungültiger Wiederherstellungscode.',401);
+  const salt=randomBytes(16).toString('hex'),secret=(await passwordHash(password,salt)).toString('hex');
+  transaction(()=>{
+   if(!db.prepare('DELETE FROM recovery WHERE digest=?').run(hash).changes)throw invalid('Code bereits verwendet.');
+   db.prepare('INSERT INTO credentials VALUES (?,?,?,?) ON CONFLICT(owner) DO UPDATE SET username=excluded.username,salt=excluded.salt,hash=excluded.hash').run(owner,username,salt,secret);
+   db.prepare("DELETE FROM objects WHERE key LIKE 'session/%' AND json_extract(CAST(body AS TEXT),'$.owner')=?").run(owner);
+  });return owner;
+ },
  oauth(subject,target,name,avatar){
   const existing=db.prepare('SELECT owner FROM identities WHERE subject=?').get(subject)?.owner ||
-   (db.prepare('SELECT owner FROM accounts WHERE owner=?').get(subject)?.owner);
+   (!db.prepare('SELECT 1 FROM detached WHERE subject=?').get(subject)&&db.prepare('SELECT owner FROM accounts WHERE owner=?').get(subject)?.owner);
   if(target&&existing&&target!==existing)throw invalid('Diese Anmeldung gehört bereits zu einem anderen Konto.',409);
-  const owner=target||existing||subject;
+  const owner=target||existing||(db.prepare('SELECT 1 FROM detached WHERE subject=?').get(subject)?'local:'+randomUUID():subject);
   db.prepare('INSERT INTO identities VALUES (?,?,?,?) ON CONFLICT(subject) DO UPDATE SET name=excluded.name,avatar=excluded.avatar').run(subject,owner,name,avatar);
   this.profile(owner);return owner;
  },
@@ -121,7 +216,7 @@ const accounts = {
   profile(owner) {
     db.prepare('INSERT OR IGNORE INTO accounts(owner) VALUES (?)').run(owner);
     const profile = db.prepare('SELECT * FROM accounts WHERE owner=?').get(owner);
-    return {...profile,...details(owner), maxMiB:limits[profile.role]};
+    return {...profile,autoDelete:!['admin','pro'].includes(profile.role)||db.prepare('SELECT enabled FROM retention WHERE owner=?').get(owner)?.enabled!==0,...details(owner), maxMiB:limits[profile.role]};
   },
   list(owner) {
     return db.prepare(`SELECT substr(key,instr(key,'/')+1) AS code,json_extract(metadata,'$.revoked') AS revoked,
@@ -173,6 +268,7 @@ if (process.argv[2] === 'roles') {
   db.close(); process.exit(0);
 }
 const env = {...process.env, BUCKET:bucket, ACCOUNTS:accounts};
+const collect=()=>sweep().catch(e=>console.error('Bereinigung:',e.message));collect();setInterval(collect,60000).unref();
 const authAttempts=new Map();
 const cleanup=setInterval(()=>{for(const [key,entry] of authAttempts)if(entry.until<=Date.now())authAttempts.delete(key)},60000);
 cleanup.unref();
@@ -185,7 +281,7 @@ http.createServer(async (incoming, outgoing) => {
     if (url.pathname === '/healthz') { db.prepare('SELECT 1').get(); outgoing.end('ok'); return; }
     if (url.pathname === '/signout-with-chatgpt') { outgoing.writeHead(303,{Location:'/'}).end(); return; }
     const headers = new Headers();
-    for (const name of ['origin','cookie','content-type','content-length']) {
+    for (const name of ['origin','cookie','content-type','content-length','user-agent']) {
       if (incoming.headers[name]) headers.set(name,incoming.headers[name]);
     }
     if(incoming.method==='POST'&&url.pathname.startsWith('/auth/local/')&&headers.get('origin')===origin.origin){
