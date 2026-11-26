@@ -1,7 +1,8 @@
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { unlink } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { promisify } from 'node:util';
+import { randomUUID, scrypt, randomBytes, timingSafeEqual, createHash } from 'node:crypto';
 import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, createReadStream, createWriteStream } from 'node:fs';
@@ -62,11 +63,65 @@ db.exec(`CREATE TABLE IF NOT EXISTS accounts (
 );
 CREATE INDEX IF NOT EXISTS objects_owner ON objects(json_extract(metadata,'$.owner'));`);
 const limits = {standard:25, plus:50, pro:100, admin:null};
+db.exec(`CREATE TABLE IF NOT EXISTS identities (subject TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, avatar TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS identities_owner ON identities(owner);
+CREATE TABLE IF NOT EXISTS credentials (owner TEXT PRIMARY KEY, username TEXT UNIQUE COLLATE NOCASE NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS profiles (owner TEXT PRIMARY KEY, nickname TEXT NOT NULL, email TEXT NOT NULL, picture TEXT NOT NULL);`);
+const invalid=(message,status=400)=>Object.assign(Error(message),{status});
+const derive=promisify(scrypt);
+let hashing=0;
+async function passwordHash(password,salt){
+ if(hashing>=2)throw invalid('Bitte gleich erneut versuchen.',429);
+ hashing++;
+ try{return await derive(password,salt,64,{N:32768,r:8,p:3,maxmem:64*1024*1024})}finally{hashing--}
+}
+function details(owner){
+ const prefs=db.prepare('SELECT nickname,email,picture FROM profiles WHERE owner=?').get(owner)||{nickname:'',email:'',picture:'login'};
+ const providers=db.prepare('SELECT subject,name,avatar FROM identities WHERE owner=? ORDER BY rowid').all(owner);
+ const username=db.prepare('SELECT username FROM credentials WHERE owner=?').get(owner)?.username||'';
+ const nickname=prefs.nickname||(owner.startsWith('local:')?username:'')||providers.find(p=>p.subject===owner)?.name||providers[0]?.name||username||owner;
+ const avatar=prefs.picture==='gravatar'&&prefs.email?'https://www.gravatar.com/avatar/'+createHash('sha256').update(prefs.email.trim().toLowerCase()).digest('hex')+'?s=96&d=identicon':providers.find(p=>p.avatar)?.avatar||'';
+ return {...prefs,nickname,avatar,username,methods:providers.map(p=>p.subject.split(':')[0])};
+}
 const accounts = {
+ oauth(subject,target,name,avatar){
+  const existing=db.prepare('SELECT owner FROM identities WHERE subject=?').get(subject)?.owner ||
+   (db.prepare('SELECT owner FROM accounts WHERE owner=?').get(subject)?.owner);
+  if(target&&existing&&target!==existing)throw invalid('Diese Anmeldung gehört bereits zu einem anderen Konto.',409);
+  const owner=target||existing||subject;
+  db.prepare('INSERT INTO identities VALUES (?,?,?,?) ON CONFLICT(subject) DO UPDATE SET name=excluded.name,avatar=excluded.avatar').run(subject,owner,name,avatar);
+  this.profile(owner);return owner;
+ },
+ edit(owner,{nickname,email,picture}){
+  if(typeof nickname!=='string'||nickname.length>80||typeof email!=='string'||email.length>254||!['login','gravatar'].includes(picture)||(picture==='gravatar'&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)))throw invalid('Bitte prüfe Nickname und Gravatar-Adresse.');
+  db.prepare('INSERT OR REPLACE INTO profiles VALUES (?,?,?,?)').run(owner,nickname.trim(),email.trim(),picture);
+ },
+ async local(action,owner,{username,password,current}){
+  if(typeof username!=='string'||!/^[a-zA-Z0-9_.-]{3,40}$/.test(username)||typeof password!=='string'||password.length>256)throw invalid('Username: 3–40 Buchstaben, Zahlen oder . _ -');
+  const entry=action==='login'?db.prepare('SELECT * FROM credentials WHERE username=?').get(username):owner&&db.prepare('SELECT * FROM credentials WHERE owner=?').get(owner);
+  if(action==='login'||entry){
+   const input=action==='login'?password:current;
+   if(typeof input!=='string'||input.length>256)throw invalid('Aktuelles Passwort erforderlich.');
+   const actual=await passwordHash(input,entry?.salt||'viewdeck-dummy-salt');
+   if(!entry||!timingSafeEqual(actual,Buffer.from(entry.hash,'hex')))throw invalid('Anmeldedaten ungültig.',401);
+   if(action==='login')return entry.owner;
+  }
+  if(password.length<12)throw invalid('Bitte mindestens 12 Zeichen als Passwort verwenden.');
+  owner=owner||'local:'+randomUUID();
+  const salt=randomBytes(16).toString('hex'),hash=(await passwordHash(password,salt)).toString('hex');
+  try{
+   if(entry){
+    const changed=db.prepare('UPDATE credentials SET username=?,salt=?,hash=? WHERE owner=? AND hash=?').run(username,salt,hash,owner,entry.hash);
+    if(!changed.changes)throw invalid('Profil wurde zwischenzeitlich geändert.',409);
+    db.prepare("DELETE FROM objects WHERE key LIKE 'session/%' AND json_extract(CAST(body AS TEXT),'$.owner')=?").run(owner);
+   }else db.prepare('INSERT INTO credentials VALUES (?,?,?,?)').run(owner,username,salt,hash);
+  }catch(e){if(String(e.message).includes('UNIQUE'))throw invalid('Username oder Zugang bereits belegt.',409);throw e}
+  this.profile(owner);return owner;
+ },
   profile(owner) {
     db.prepare('INSERT OR IGNORE INTO accounts(owner) VALUES (?)').run(owner);
     const profile = db.prepare('SELECT * FROM accounts WHERE owner=?').get(owner);
-    return {...profile, maxMiB:limits[profile.role]};
+    return {...profile,...details(owner), maxMiB:limits[profile.role]};
   },
   list(owner) {
     return db.prepare(`SELECT substr(key,instr(key,'/')+1) AS code,json_extract(metadata,'$.revoked') AS revoked,
@@ -107,7 +162,7 @@ const accounts = {
 if (process.argv[2] === 'roles') {
   const [command, owner, role] = process.argv.slice(3);
   if (command === 'list') {
-    console.table(db.prepare('SELECT owner,role FROM accounts ORDER BY owner').all());
+    console.table(db.prepare('SELECT owner,role FROM accounts ORDER BY owner').all().map(row=>({...row,nickname:details(row.owner).nickname})));
   } else if (command === 'set' && owner && Object.hasOwn(limits,role)) {
     const result=db.prepare('UPDATE accounts SET role=? WHERE owner=?').run(role, owner);
     if (!result.changes) { console.error('Unbekannte Konto-ID. Einmal in Viewdeck anmelden.'); process.exit(1); }
@@ -118,6 +173,9 @@ if (process.argv[2] === 'roles') {
   db.close(); process.exit(0);
 }
 const env = {...process.env, BUCKET:bucket, ACCOUNTS:accounts};
+const authAttempts=new Map();
+const cleanup=setInterval(()=>{for(const [key,entry] of authAttempts)if(entry.until<=Date.now())authAttempts.delete(key)},60000);
+cleanup.unref();
 http.createServer(async (incoming, outgoing) => {
   try {
     const path = incoming.url;
@@ -129,6 +187,12 @@ http.createServer(async (incoming, outgoing) => {
     const headers = new Headers();
     for (const name of ['origin','cookie','content-type','content-length']) {
       if (incoming.headers[name]) headers.set(name,incoming.headers[name]);
+    }
+    if(incoming.method==='POST'&&url.pathname.startsWith('/auth/local/')&&headers.get('origin')===origin.origin){
+      const key=incoming.socket.remoteAddress,now=Date.now();
+      let entry=authAttempts.get(key);
+      if(!entry||entry.until<=now){entry={count:0,until:now+60000};authAttempts.set(key,entry)}
+      if(++entry.count>60){outgoing.writeHead(429,{'Content-Type':'application/json','Retry-After':'60'}).end(JSON.stringify('Zu viele Versuche. Bitte später erneut versuchen.'));return}
     }
     let limit = 32*1024;
     let body;
