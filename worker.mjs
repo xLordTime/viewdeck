@@ -9,25 +9,33 @@ const setCookie=(key,value,seconds)=>key+'='+value+'; Path=/; Secure; HttpOnly; 
 const jump=(url,c)=>new Response(null,{status:303,headers:{Location:url,'Set-Cookie':c,'Cache-Control':'no-store'}});
 function enabled(env,p){return !!(env[p.toUpperCase()+'_CLIENT_ID']&&env[p.toUpperCase()+'_CLIENT_SECRET'])}
 export async function identity(req,env){
- const native=req.headers.get('oai-authenticated-user-id');if(native)return native;
+ const native=req.headers.get('oai-authenticated-user-id');if(native&&!env.ACCOUNTS&&env.GATEWAY_SHARED_SECRET){
+  const supplied=req.headers.get('x-viewdeck-gateway-secret')||'';
+  const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(env.GATEWAY_SHARED_SECRET),{name:'HMAC',hash:'SHA-256'},false,['sign','verify']);
+  const message=new TextEncoder().encode('viewdeck gateway');
+  if(supplied.length && supplied.length<=512){
+   const providedKey=await crypto.subtle.importKey('raw',new TextEncoder().encode(supplied),{name:'HMAC',hash:'SHA-256'},false,['sign']);
+   if(await crypto.subtle.verify('HMAC',key,await crypto.subtle.sign('HMAC',providedKey,message),message))return native;
+  }
+ }
  const id=cookie(req,'__Host-vds');if(!id||!/^[a-f0-9-]{72}$/.test(id))return null;
  const entry=await env.BUCKET.get('session/'+id);if(!entry)return null;
  const s=await entry.json();if(s.until>Date.now())return s.owner;
  await env.BUCKET.delete('session/'+id);return null;
 }
-async function session(env,owner){
+async function session(env,owner,req){
  const id=token();
- await env.BUCKET.put('session/'+id,JSON.stringify({owner,until:Date.now()+86400000}));
+ await env.BUCKET.put('session/'+id,JSON.stringify({owner,device:(req.headers.get('user-agent')||'Browser').slice(0,180),until:Date.now()+86400000}));
  return setCookie('__Host-vds',id,86400);
 }
 async function oauth(req,env,u){
  if(u.pathname.startsWith('/auth/local/')){
   if(!env.ACCOUNTS||req.method!=='POST'||req.headers.get('Origin')!==u.origin)return json('Ungültige Anfrage',403);
   const action=u.pathname.slice('/auth/local/'.length), owner=await identity(req,env);
-  if(!['register','login','update'].includes(action)||(action==='update'?!owner:!!owner))return json('Aktion nicht verfügbar.',400);
+  if(!['register','login','update','recover'].includes(action)||(action==='update'?!owner:!!owner))return json('Aktion nicht verfügbar.',400);
   try{
-   const canonical=await env.ACCOUNTS.local(action,owner,await req.json());
-   return Response.json(true,{headers:{'Set-Cookie':await session(env,canonical),'Cache-Control':'no-store'}});
+   const data=await req.json();const canonical=action==='recover'?await env.ACCOUNTS.recover(data):await env.ACCOUNTS.local(action,owner,data);
+   return Response.json(action==='register'?{codes:env.ACCOUNTS.codes(canonical)}:true,{headers:{'Set-Cookie':await session(env,canonical,req),'Cache-Control':'no-store'}});
   }catch(e){return json(e.status?e.message:'Anfrage fehlgeschlagen.',e.status||400)}
  }
  if (u.pathname === '/auth/logout' && req.method === 'GET') {
@@ -53,7 +61,7 @@ async function oauth(req,env,u){
  const avatar=p==='discord'&&data.avatar?'https://cdn.discordapp.com/avatars/'+encodeURIComponent(sub)+'/'+encodeURIComponent(data.avatar)+'.png':p==='google'&&/^https:\/\//.test(data.picture||'')?data.picture:'';
  let owner;
  try{owner=env.ACCOUNTS?env.ACCOUNTS.oauth(subject,target,name,avatar):subject}catch(e){return json(e.status?e.message:'Anmeldung fehlgeschlagen',e.status||500)}
- const done=jump('/',await session(env,owner));done.headers.append('Set-Cookie',setCookie('__Host-vdo','',0));return done;
+ const done=jump('/',await session(env,owner,req));done.headers.append('Set-Cookie',setCookie('__Host-vdo','',0));return done;
 }
 
 const json=(v,status=200)=>Response.json(v,{status,headers:{'Cache-Control':'no-store'}});
@@ -67,6 +75,21 @@ export default {async fetch(req,env){
  if(req.method==='POST'){
   if(!owner)return json('Anmeldung erforderlich',401);
   if(req.headers.get('Origin')!==u.origin)return json('Ungültiger Ursprung',403);
+  if(p==='/api/manage'&&env.ACCOUNTS){
+   try{
+    const {action,id,enabled}=await req.json();
+    switch(action){
+     case 'security':return json(env.ACCOUNTS.security(owner,cookie(req,'__Host-vds')));
+     case 'end':env.ACCOUNTS.endSession(owner,id);break;
+     case 'unlink':env.ACCOUNTS.unlink(owner,id);break;
+     case 'codes':return json(env.ACCOUNTS.codes(owner));
+     case 'retention':env.ACCOUNTS.retention(owner,enabled);break;
+     case 'delete':if(!valid(id))return json('Ungültiger Code',400);env.ACCOUNTS.erase(owner,id);break;
+     default:return json('Unbekannte Aktion',400);
+    }
+    return json(true);
+   }catch(e){return json(e.status?e.message:'Aktion fehlgeschlagen',e.status||400)}
+  }
   if(p==='/api/profile'&&env.ACCOUNTS){
    try{env.ACCOUNTS.edit(owner,await req.json());return json(true)}catch(e){return json(e.status?e.message:'Ungültige Profildaten',e.status||400)}
   }
@@ -86,7 +109,9 @@ export default {async fetch(req,env){
    const maxMiB=env.ACCOUNTS ? env.ACCOUNTS.profile(owner).maxMiB : 25;
    if(!name||!size)return json('Dateiname oder Inhalt fehlt.',400);
    if(maxMiB!==null && size>maxMiB*1024*1024)return json('Maximal '+maxMiB+' MiB pro Datei.',413);
-   const id=code();await bucket.put('file/'+id,req.body,{customMetadata:{name,owner}});
+   const replace=u.searchParams.get('replace');
+   if(replace&&(!env.ACCOUNTS||!valid(replace)||(await bucket.head('file/'+replace))?.customMetadata.owner!==owner))return json('Datei nicht gefunden',404);
+   const id=replace||code();await bucket.put('file/'+id,req.body,{replace:!!replace,customMetadata:{name,owner}});
    return json({id,name});
   }
   if(p==='/api/group'){
