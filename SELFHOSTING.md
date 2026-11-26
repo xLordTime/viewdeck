@@ -79,3 +79,10 @@ docker compose exec web node server.mjs roles list
 docker compose exec web node server.mjs roles set 'discord:DEINE_USER_ID' admin
 ```
 Mit `standard` setzt du das Limit zurück. Bestehende Dateien behalten ihren Code. Lade die Seite nach einer Rollenänderung neu.
+
+## Aufbewahrung, Freigaben und Konto
+Die automatische Löschung ist standardmäßig aktiv. Standard behält Dateien 15 Tage, Plus, Pro und Admin 30 Tage. Pro und Admin können die Löschung für ihr Konto abschalten. Maßgeblich sind die aktuelle Rolle und das Upload- bzw. Ersetzungsdatum. Bei älteren Dateien beginnt die Frist mit dem ersten Start dieser Version. Nach erneutem Einschalten können bereits ältere Dateien sofort ablaufen. Die Bereinigung prüft minütlich. Leere Sammlungen werden beim Entfernen der letzten Datei gelöscht. Vorhandene Backups haben ihre eigene Aufbewahrungsfrist.
+
+Dateien können unter „Meine Codes“ bei gleichem Code ersetzt oder endgültig gelöscht werden. Der QR-Code entsteht im Browser. Im Profil lassen sich einzelne Sitzungen beenden und zusätzliche Anmeldemethoden trennen. Zur Kontowiederherstellung dienen fünf einmalig angezeigte Einmalcodes. Frisch erzeugte Codes ersetzen den vorigen Satz. Bei einer Wiederherstellung werden bestehende Sitzungen beendet.
+
+Nur beim Sites-Gateway mit nativer Identität: Das Gateway muss eingehende Identitäts- und Secret-Header entfernen und selbst einen vertrauenswürdigen Benutzerwert und `x-viewdeck-gateway-secret` setzen. Das zugehörige zufällige Secret wird ausschließlich am Gateway und im Worker als `GATEWAY_SHARED_SECRET` hinterlegt. Ohne diese Konfiguration stehen die anbietergestützten Sitzungen zur Verfügung. Docker nutzt ausschließlich die Viewdeck-Sitzung.
