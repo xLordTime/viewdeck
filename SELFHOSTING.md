@@ -59,3 +59,15 @@ backup="$HOME/viewdeck-backups/viewdeck-$(date +%Y%m%d-%H%M%S).sqlite"
 docker compose exec -T web node --input-type=module -e "import {DatabaseSync} from 'node:sqlite'; import fs from 'node:fs'; const p='/tmp/backup-'+process.pid; const db=new DatabaseSync('/data/viewdeck.sqlite'); db.exec(\"VACUUM INTO '\"+p+\"'\"); db.close(); fs.createReadStream(p).on('close',()=>fs.unlinkSync(p)).pipe(process.stdout)" > "$backup" && test -s "$backup"
 ```
 Sichere auch .env vertraulich und kopiere beides auf einen zweiten Datenträger. Zum Stoppen genügt `docker compose stop`. Der Zusatz `-v` bei `docker compose down` löscht das Datenvolume.
+
+## Persönliche Codes und Rollen
+Nach der Anmeldung zeigt „Meine Codes“ deine Dateien und Sammlungen einschließlich früherer Uploads desselben Kontos. Unter Einstellungen kannst du Sortierung und Standardfilter pro Konto speichern. Google und Discord führen getrennte Konten.
+
+Die Rolle gilt pro Datei: standard 25 MiB, plus 50 MiB, pro 100 MiB. Passe das Uploadlimit deines Reverse-Proxys an die größte genutzte Rolle an. Die Konto-ID steht unter „Meine Codes“. Rollen vergibst du ausschließlich in der Serverkonsole:
+
+```bash
+cd /srv/web-hosting/Viewdeck
+docker compose exec web node server.mjs roles list
+docker compose exec web node server.mjs roles set 'discord:DEINE_USER_ID' plus
+```
+Mit `standard` setzt du das Limit zurück. Bestehende Dateien behalten ihren Code. Lade die Seite nach einer Rollenänderung neu.

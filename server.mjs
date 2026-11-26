@@ -2,7 +2,7 @@ import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import worker from './worker.mjs';
+import worker, {identity} from './worker.mjs';
 
 const origin = new URL(process.env.PUBLIC_ORIGIN);
 if (origin.protocol !== 'https:' || origin.href !== origin.origin + '/') {
@@ -32,7 +32,45 @@ const bucket = {
   delete(key) { remove.run(key); }
 };
 
-const env = {...process.env, BUCKET:bucket};
+db.exec(`CREATE TABLE IF NOT EXISTS accounts (
+  owner TEXT PRIMARY KEY, role TEXT NOT NULL DEFAULT 'standard',
+  sorting TEXT NOT NULL DEFAULT 'newest', filter TEXT NOT NULL DEFAULT 'all'
+);
+CREATE INDEX IF NOT EXISTS objects_owner ON objects(json_extract(metadata,'$.owner'));`);
+const limits = {standard:25, plus:50, pro:100};
+const accounts = {
+  profile(owner) {
+    db.prepare('INSERT OR IGNORE INTO accounts(owner) VALUES (?)').run(owner);
+    const profile = db.prepare('SELECT * FROM accounts WHERE owner=?').get(owner);
+    return {...profile, maxMiB:limits[profile.role]};
+  },
+  list(owner) {
+    return db.prepare(`SELECT substr(key,instr(key,'/')+1) AS code,
+      CASE WHEN key LIKE 'file/%' THEN 'file' ELSE 'group' END AS kind,
+      CASE WHEN key LIKE 'file/%' THEN json_extract(metadata,'$.name')
+           ELSE json_extract(CAST(body AS TEXT),'$.title') END AS name
+      FROM objects WHERE json_extract(metadata,'$.owner')=? AND
+      (key LIKE 'file/%' OR key LIKE 'group/%') ORDER BY rowid DESC`).all(owner);
+  },
+  save(owner, sorting, filter) {
+    this.profile(owner);
+    db.prepare('UPDATE accounts SET sorting=?, filter=? WHERE owner=?').run(sorting,filter,owner);
+  }
+};
+if (process.argv[2] === 'roles') {
+  const [command, owner, role] = process.argv.slice(3);
+  if (command === 'list') {
+    console.table(db.prepare('SELECT owner,role FROM accounts ORDER BY owner').all());
+  } else if (command === 'set' && owner && Object.hasOwn(limits,role)) {
+    const result=db.prepare('UPDATE accounts SET role=? WHERE owner=?').run(role, owner);
+    if (!result.changes) { console.error('Unbekannte Konto-ID. Einmal in Viewdeck anmelden.'); process.exit(1); }
+    console.log(owner,role);
+  } else {
+    console.error('roles list | roles set KONTO-ID standard|plus|pro'); process.exit(1);
+  }
+  db.close(); process.exit(0);
+}
+const env = {...process.env, BUCKET:bucket, ACCOUNTS:accounts};
 http.createServer(async (incoming, outgoing) => {
   try {
     const path = incoming.url;
@@ -45,7 +83,15 @@ http.createServer(async (incoming, outgoing) => {
     for (const name of ['origin','cookie','content-type','content-length']) {
       if (incoming.headers[name]) headers.set(name,incoming.headers[name]);
     }
-    const limit = url.pathname === '/api/upload' ? 25*1024*1024 : 32*1024;
+    let limit = 32*1024;
+    if (incoming.method === 'POST' && url.pathname === '/api/upload') {
+      const owner = await identity(new Request(url,{headers}), env);
+      if (!owner) { outgoing.writeHead(401,{'Content-Type':'application/json'}).end(JSON.stringify('Anmeldung erforderlich')); return; }
+      limit = accounts.profile(owner).maxMiB * 1024 * 1024;
+      if (Number(headers.get('content-length')) > limit) {
+        outgoing.writeHead(413,{'Content-Type':'application/json'}).end(JSON.stringify('Datei überschreitet dein Uploadlimit.')); return;
+      }
+    }
     let body;
     if (incoming.method === 'POST') {
       const parts = [];

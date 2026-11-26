@@ -8,7 +8,7 @@ const token=()=>crypto.randomUUID()+crypto.randomUUID();
 const setCookie=(key,value,seconds)=>key+'='+value+'; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age='+seconds;
 const jump=(url,c)=>new Response(null,{status:303,headers:{Location:url,'Set-Cookie':c,'Cache-Control':'no-store'}});
 function enabled(env,p){return !!(env[p.toUpperCase()+'_CLIENT_ID']&&env[p.toUpperCase()+'_CLIENT_SECRET'])}
-async function identity(req,env){
+export async function identity(req,env){
  const native=req.headers.get('oai-authenticated-user-id');if(native)return native;
  const id=cookie(req,'__Host-vds');if(!id||!/^[a-f0-9-]{72}$/.test(id))return null;
  const entry=await env.BUCKET.get('session/'+id);if(!entry)return null;
@@ -36,15 +36,22 @@ const json=(v,status=200)=>Response.json(v,{status,headers:{'Cache-Control':'no-
 const code=()=>Array.from(crypto.getRandomValues(new Uint8Array(8)),v=>'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[v%32]).join('');
 const valid=c=>/^[A-Z2-9]{8}$/.test(c);
 export default {async fetch(req,env){
- const u=new URL(req.url), p=u.pathname; if(p.startsWith('/auth/'))return oauth(req,env,u); const owner=(p==='/api/me'||req.method==='POST')?await identity(req,env):null;
+ const u=new URL(req.url), p=u.pathname; if(p.startsWith('/auth/'))return oauth(req,env,u); const owner=(p==='/api/me'||p==='/api/library'||req.method==='POST')?await identity(req,env):null;
  const bucket=env.BUCKET;
- if(p==='/api/me')return json({signed:!!owner,providers:Object.keys(providers).filter(p=>enabled(env,p))});
+ if(p==='/api/me')return json({signed:!!owner,profile:owner&&env.ACCOUNTS?env.ACCOUNTS.profile(owner):null,providers:Object.keys(providers).filter(p=>enabled(env,p))});
+ if(p==='/api/library' && env.ACCOUNTS) return owner?json(env.ACCOUNTS.list(owner)):json('Anmeldung erforderlich',401);
  if(req.method==='POST'){
   if(!owner)return json('Anmeldung erforderlich',401);
   if(req.headers.get('Origin')!==u.origin)return json('Ungültiger Ursprung',403);
+  if(p==='/api/settings' && env.ACCOUNTS){
+   const settings=await req.json().catch(()=>null);
+   if(!settings || !['newest','name'].includes(settings.sorting) || !['all','file','group'].includes(settings.filter))return json('Ungültige Einstellung',400);
+   env.ACCOUNTS.save(owner,settings.sorting,settings.filter);return json(true);
+  }
   if(p==='/api/upload'){
    const size=Number(req.headers.get('content-length')),name=u.searchParams.get('name')?.slice(0,220);
-   if(!name||!size||size>25*1024*1024)return json('Maximal 25 MB pro Datei.',413);
+   const maxMiB=env.ACCOUNTS?.profile(owner).maxMiB||25;
+   if(!name||!size||size>maxMiB*1024*1024)return json('Maximal '+maxMiB+' MiB pro Datei.',413);
    const id=code();await bucket.put('file/'+id,req.body,{customMetadata:{name,owner}});
    return json({id,name});
   }
