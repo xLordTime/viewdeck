@@ -58,6 +58,14 @@ mkdir -p "$HOME/viewdeck-backups"
 backup="$HOME/viewdeck-backups/viewdeck-$(date +%Y%m%d-%H%M%S).sqlite"
 docker compose exec -T web node --input-type=module -e "import {DatabaseSync} from 'node:sqlite'; import fs from 'node:fs'; const p='/tmp/backup-'+process.pid; const db=new DatabaseSync('/data/viewdeck.sqlite'); db.exec(\"VACUUM INTO '\"+p+\"'\"); db.close(); fs.createReadStream(p).on('close',()=>fs.unlinkSync(p)).pipe(process.stdout)" > "$backup" && test -s "$backup"
 ```
+Neue Uploads liegen unter /data/files. Kopiere nach dem Datenbank-Snapshot auch diese unveränderlichen Dateien in dasselbe Backup. Halte während der Sicherung das Volume verfügbar. Beispiel aus dem Projektverzeichnis:
+
+```bash
+docker compose cp web:/data/files "${backup%.sqlite}-files"
+```
+
+Für eine Wiederherstellung gehören die zugehörige Datenbank und das Dateiverzeichnis zusammen in das Datenvolume. Ältere Uploads bleiben direkt in der Datenbank lesbar.
+
 Sichere auch .env vertraulich und kopiere beides auf einen zweiten Datenträger. Zum Stoppen genügt `docker compose stop`. Der Zusatz `-v` bei `docker compose down` löscht das Datenvolume.
 
 ## Persönliche Codes und Rollen
