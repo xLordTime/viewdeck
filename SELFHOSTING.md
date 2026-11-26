@@ -69,7 +69,7 @@ Für eine Wiederherstellung gehören die zugehörige Datenbank und das Dateiverz
 Sichere auch .env vertraulich und kopiere beides auf einen zweiten Datenträger. Zum Stoppen genügt `docker compose stop`. Der Zusatz `-v` bei `docker compose down` löscht das Datenvolume.
 
 ## Persönliche Codes und Rollen
-Nach der Anmeldung zeigt „Meine Codes“ deine Dateien und Sammlungen einschließlich früherer Uploads desselben Kontos. Unter Einstellungen kannst du Sortierung und Standardfilter pro Konto speichern. Google und Discord führen getrennte Konten.
+Nach der Anmeldung zeigt „Meine Codes“ deine Dateien und Sammlungen einschließlich früherer Uploads desselben Kontos. Unter Einstellungen kannst du Sortierung und Standardfilter pro Konto speichern. Unter „Mein Profil“ lassen sich Nickname und Bildquelle ändern sowie Google, Discord und ein lokaler Username mit Passwort am selben Konto verknüpfen. Öffne die Verknüpfung im bereits angemeldeten Konto. Bestehende getrennte Konten werden nicht automatisch zusammengeführt. Beim ersten erneuten Anbieter-Login werden Name und Bild bestehender Konten übernommen. Gravatar verwendet auf Wunsch die im Profil angegebene E-Mail-Adresse.
 
 Die Rolle gilt pro Datei: standard 25 MiB, plus 50 MiB, pro 100 MiB, admin ohne anwendungsseitiges Dateigrößenlimit. Passe das Uploadlimit deines Reverse-Proxys an die größte genutzte Rolle an. Die Konto-ID steht unter „Meine Codes“. Rollen vergibst du ausschließlich in der Serverkonsole:
 
