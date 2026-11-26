@@ -16,6 +16,10 @@ async function identity(req,env){
  await env.BUCKET.delete('session/'+id);return null;
 }
 async function oauth(req,env,u){
+ if (u.pathname === '/auth/logout' && req.method === 'GET') {
+  const html = '<!doctype html><html lang="de"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Viewdeck · Abmelden</title><main><h1>Von Viewdeck abmelden?</h1><form method="post" action="/auth/logout"><button>Abmelden</button></form><p><a href="/">Zurück zu Viewdeck</a></p></main></html>';
+  return new Response(html,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','Referrer-Policy':'same-origin','Content-Security-Policy':"frame-ancestors 'none'; form-action 'self'"}});
+ }
  if(u.pathname==='/auth/logout'){if(req.method!=='POST'||req.headers.get('Origin')!==u.origin)return new Response(null,{status:403});const id=cookie(req,'__Host-vds');if(id&&/^[a-f0-9-]{72}$/.test(id))await env.BUCKET.delete('session/'+id);return jump('/signout-with-chatgpt?return_to=/',setCookie('__Host-vds','',0))}
  const [,a,p,step]=u.pathname.split('/'),provider=Object.hasOwn(providers,p)&&providers[p];if(!provider||!enabled(env,p))return new Response('Anbieter ist noch nicht eingerichtet.',{status:503});
  const redirect=u.origin+'/auth/'+p+'/callback',client_id=env[p.toUpperCase()+'_CLIENT_ID'];
@@ -59,7 +63,7 @@ export default {async fetch(req,env){
   const ext=name.split('.').pop().toLowerCase(),type={pdf:'application/pdf',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',webp:'image/webp',txt:'text/plain; charset=utf-8'}[ext];
   return new Response((await bucket.get('file/'+id)).body,{headers:{'Content-Type':type||'application/octet-stream','Content-Disposition':(route==='download'||!type?'attachment':'inline')+"; filename*=UTF-8''"+encodeURIComponent(name),'X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'}});
  }
- if(p==='/'||route==='v')return new Response(page,{headers:{'Content-Type':'text/html;charset=utf-8','Referrer-Policy':'no-referrer'}});
+ if(p==='/'||route==='v')return new Response(page,{headers:{'Content-Type':'text/html;charset=utf-8','Referrer-Policy':'same-origin'}});
  return json('Nicht gefunden',404);
 }};
 
