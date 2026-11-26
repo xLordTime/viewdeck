@@ -50,8 +50,9 @@ export default {async fetch(req,env){
   }
   if(p==='/api/upload'){
    const size=Number(req.headers.get('content-length')),name=u.searchParams.get('name')?.slice(0,220);
-   const maxMiB=env.ACCOUNTS?.profile(owner).maxMiB||25;
-   if(!name||!size||size>maxMiB*1024*1024)return json('Maximal '+maxMiB+' MiB pro Datei.',413);
+   const maxMiB=env.ACCOUNTS ? env.ACCOUNTS.profile(owner).maxMiB : 25;
+   if(!name||!size)return json('Dateiname oder Inhalt fehlt.',400);
+   if(maxMiB!==null && size>maxMiB*1024*1024)return json('Maximal '+maxMiB+' MiB pro Datei.',413);
    const id=code();await bucket.put('file/'+id,req.body,{customMetadata:{name,owner}});
    return json({id,name});
   }
