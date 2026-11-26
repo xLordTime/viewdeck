@@ -48,6 +48,12 @@ export default {async fetch(req,env){
    if(!settings || !['newest','name'].includes(settings.sorting) || !['all','file','group'].includes(settings.filter))return json('Ungültige Einstellung',400);
    env.ACCOUNTS.save(owner,settings.sorting,settings.filter);return json(true);
   }
+  if(p==='/api/share' && env.ACCOUNTS){
+   const {id,action}=await req.json();
+   if(!valid(id)||!['rotate','revoke'].includes(action))return json('Ungültige Freigabe',400);
+   const next=code();
+   return env.ACCOUNTS.share(owner,id,action,next)?json({id:action==='rotate'?next:id}):json('Freigabe nicht gefunden',404);
+  }
   if(p==='/api/upload'){
    const size=Number(req.headers.get('content-length')),name=u.searchParams.get('name')?.slice(0,220);
    const maxMiB=env.ACCOUNTS ? env.ACCOUNTS.profile(owner).maxMiB : 25;
@@ -65,7 +71,8 @@ export default {async fetch(req,env){
  const [_,route,id]=p.split('/');
  if(valid(id)&&['meta','file','download'].includes(route)){
   const f=await bucket.head('file/'+id);
-  if(!f){const g=route==='meta'&&await bucket.get('group/'+id);return g?json(await g.json()):json('View-Code nicht gefunden',404)}
+  if(f?.customMetadata.revoked)return json('Freigabe deaktiviert',404);
+  if(!f){const g=route==='meta'&&await bucket.get('group/'+id);return g&&!g.customMetadata.revoked?json(await g.json()):json('View-Code nicht gefunden',404)}
   const name=f.customMetadata.name;
   if(route==='meta')return json({name,id});
   const ext=name.split('.').pop().toLowerCase(),type={pdf:'application/pdf',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',webp:'image/webp',txt:'text/plain; charset=utf-8'}[ext];
